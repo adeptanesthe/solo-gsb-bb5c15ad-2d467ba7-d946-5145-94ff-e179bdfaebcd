@@ -16,6 +16,9 @@ const state = {
   importCsv: null, // 最近一次选择的 CSV 原文
   importPlan: null, // 服务端返回的导入计划（含 rows / newActors / summary / version）
   importFileName: '',
+  replayCsv: null, // 最近一次复盘 CSV 原文（只读分析，不写库）
+  replayResult: null, // 最近一次现场走位复盘结果
+  replayFileName: '',
 };
 
 /* ---------- 工具 ---------- */
@@ -100,6 +103,7 @@ async function refresh() {
   renderValidation();
   renderEvacExitOptions();
   await refreshEvacuation();
+  await refreshReplay(); // 走位数据变化后基于最新数据重算已有复盘（只读）
 }
 
 /** 仅重新校验并刷新结果区（模式切换时使用） */
@@ -1376,6 +1380,236 @@ function bindImport() {
   });
 }
 
+/* ---------- 现场走位复盘 ---------- */
+
+const REPLAY_ACTOR_TAG = {
+  ok: { cls: 'reuse', text: '现有演员' },
+  unknown: { cls: 'bad', text: '未知演员' },
+  ambiguous: { cls: 'bad', text: '演员歧义' },
+};
+const REPLAY_AREA_TAG = {
+  ok: { cls: 'reuse', text: '现有区域' },
+  unknown: { cls: 'bad', text: '未知区域' },
+  ambiguous: { cls: 'bad', text: '区域歧义' },
+};
+
+/** 带符号秒数 → mm:ss（±N 秒），供时间偏差列使用 */
+function fmtDelta(sec) {
+  const sign = sec > 0 ? '+' : sec < 0 ? '-' : '';
+  return `${sign}${fmtTime(Math.abs(sec))}（${sign}${Math.abs(sec)} 秒）`;
+}
+
+function renderReplayMessage(html = '', isError = false) {
+  const el = $('replay-message');
+  el.className = isError ? 'import-message error' : 'import-message';
+  el.innerHTML = html;
+}
+
+/** 渲染复盘结果：汇总徽章 + 错误行表 + 每位演员的配对 / 漏项 / 多项 */
+function renderReplayResult(replay) {
+  const s = replay.summary;
+  const el = $('replay-results');
+
+  const chips = [
+    `<span class="imp-chip">数据行 <strong>${s.totalRows}</strong></span>`,
+    `<span class="imp-chip ${s.validRows ? 'good' : ''}">有效 <strong>${s.validRows}</strong></span>`,
+    `<span class="imp-chip ${s.errorRows ? 'bad' : ''}">错误行 <strong>${s.errorRows}</strong></span>`,
+    `<span class="imp-chip">演员 <strong>${s.actors}</strong></span>`,
+    `<span class="imp-chip">配对 <strong>${s.pairs}</strong></span>`,
+    `<span class="imp-chip ${s.missing ? 'bad' : ''}">漏执行 <strong>${s.missing}</strong></span>`,
+    `<span class="imp-chip ${s.extra ? 'bad' : ''}">多余 <strong>${s.extra}</strong></span>`,
+    `<span class="imp-chip ${s.areaMismatch ? 'bad' : ''}">区域不符 <strong>${s.areaMismatch}</strong></span>`,
+    `<span class="imp-chip new">对齐总成本 <strong>${s.totalCost}</strong></span>`,
+  ].join('');
+
+  let body = `<div class="imp-chips">${chips}</div>`;
+  body += `<p class="imp-version">口径：保持先后顺序的一对一最优对齐；配对 = |实际−计划| 秒 + 区域不符 ${replay.costs.areaMismatch}；漏执行 / 多余每条 ${replay.costs.gap}；成本相同时先取配对数多者，再取实际记录行号序列字典序较小者。</p>`;
+
+  const errorRows = replay.rows.filter((r) => !r.valid);
+  if (errorRows.length) {
+    const errRowsHtml = errorRows
+      .map((r) => {
+        const actorTag = REPLAY_ACTOR_TAG[r.actorStatus];
+        const areaTag = REPLAY_AREA_TAG[r.areaStatus];
+        return `<tr class="imp-row-err">
+          <td>${r.line}</td>
+          <td>${escapeHtml(r.name || '（空）')}<span class="time-detail">${escapeHtml(r.role || '无角色')}</span>${
+            actorTag ? `<span class="imp-tag ${actorTag.cls}">${actorTag.text}</span>` : ''
+          }</td>
+          <td>${
+            r.time === null
+              ? `<span class="imp-bad">${escapeHtml(r.timeRaw || '（空）')}</span>`
+              : `${fmtTime(r.time)}<span class="time-detail">${escapeHtml(r.timeRaw)}</span>`
+          }</td>
+          <td>${escapeHtml(r.areaName || '（空）')}${
+            areaTag ? `<span class="imp-tag ${areaTag.cls}">${areaTag.text}</span>` : ''
+          }</td>
+          <td class="imp-issue-cell"><ul class="imp-issues">${r.issues
+            .map((i) => `<li>${escapeHtml(i.message)}</li>`)
+            .join('')}</ul></td>
+        </tr>`;
+      })
+      .join('');
+    body += `<p class="imp-blocked">🚫 <strong>${errorRows.length}</strong> 行无法解析（未知 / 歧义演员或区域、时刻格式错误），未参与对齐：</p>
+      <div class="imp-table-wrap">
+        <table class="imp-table">
+          <thead><tr><th>CSV 行号</th><th>演员 / 角色</th><th>实际时刻</th><th>实际区域</th><th>错误</th></tr></thead>
+          <tbody>${errRowsHtml}</tbody>
+        </table>
+      </div>`;
+  }
+
+  body += replay.actors.map(renderReplayActor).join('');
+  el.innerHTML = body;
+}
+
+/** 时间偏差单元格：晚到红、早到金、准时绿 */
+function renderDeltaCell(delta) {
+  if (delta === 0) return `<span class="delta-tag delta-zero">±0 秒（准时）</span>`;
+  const cls = delta > 0 ? 'delta-late' : 'delta-early';
+  const text = delta > 0 ? `晚 ${delta} 秒` : `早 ${-delta} 秒`;
+  return `<span class="delta-tag ${cls}">${fmtDelta(delta)}</span><span class="time-detail">${text}</span>`;
+}
+
+/** 单演员复盘块：配对表 + 漏项 / 多项汇总 */
+function renderReplayActor(a) {
+  const gapCost = state.replayResult ? state.replayResult.costs.gap : 180;
+  const pairRows = a.pairs
+    .map((p, idx) => {
+      const areaCell = p.areaMatch
+        ? `<span class="area-tag area-ok">✅ ${escapeHtml(p.actualAreaName)}</span>`
+        : `<span class="area-tag area-bad">❌ ${escapeHtml(p.actualAreaName)}</span><span class="time-detail">计划 ${escapeHtml(p.plannedAreaName)}</span>`;
+      return `<tr class="${p.areaMatch ? '' : 'replay-area-miss'}">
+        <td>${idx + 1}</td>
+        <td>${fmtTime(p.plannedTime)}${p.cueNote ? `<span class="time-detail">${escapeHtml(p.cueNote)}</span>` : ''}</td>
+        <td>${fmtTime(p.actualTime)}<span class="time-detail">第 ${p.line} 行</span></td>
+        <td>${renderDeltaCell(p.timeDelta)}</td>
+        <td>${areaCell}</td>
+        <td>${p.cost}</td>
+      </tr>`;
+    })
+    .join('');
+
+  const missingHtml = a.missing.length
+    ? `<div class="replay-sub replay-missing">
+        <h4>漏执行口令（${a.missing.length} · 每条 ${gapCost}）</h4>
+        <ul>${a.missing
+          .map((m) => `<li><strong>${fmtTime(m.plannedTime)}</strong>「${escapeHtml(m.plannedAreaName)}」${m.cueNote ? ` · ${escapeHtml(m.cueNote)}` : ''}</li>`)
+          .join('')}</ul>
+      </div>`
+    : '';
+  const extraHtml = a.extra.length
+    ? `<div class="replay-sub replay-extra">
+        <h4>多余实际记录（${a.extra.length} · 每条 ${gapCost}）</h4>
+        <ul>${a.extra
+          .map((e) => `<li>第 ${e.line} 行：<strong>${fmtTime(e.actualTime)}</strong>「${escapeHtml(e.actualAreaName)}」</li>`)
+          .join('')}</ul>
+      </div>`
+    : '';
+
+  return `<div class="actor-block replay-actor">
+    <h3>${escapeHtml(a.actorName)}${a.actorRole ? ` <span class="cue-count">（${escapeHtml(a.actorRole)}）</span>` : ''}
+      <span class="cue-count">计划 ${a.plannedCount} · 实际 ${a.actualCount} · 配对 ${a.pairCount} · 漏 ${a.missing.length} · 多 ${a.extra.length} · 区域不符 ${a.areaMismatchCount}</span>
+      <span class="chain-tag ${a.cost > 0 ? 'late' : 'absorbed'}">时间偏差合计 ${a.timeCost} 秒 · 对齐总成本 ${a.cost}</span>
+    </h3>
+    ${
+      a.pairs.length
+        ? `<table>
+            <thead><tr><th>#</th><th>计划时刻 / 口令</th><th>实际时刻 / 行号</th><th>时间偏差</th><th>区域偏差</th><th>配对成本</th></tr></thead>
+            <tbody>${pairRows}</tbody>
+          </table>`
+        : '<p class="empty-hint">无配对。</p>'
+    }
+    ${missingHtml}
+    ${extraHtml}
+  </div>`;
+}
+
+/** 读取并上传复盘 CSV（只读分析） */
+async function analyzeReplay(csv, fileName) {
+  const replay = await api('/api/replay/analyze', 'POST', { csv, fileName });
+  state.replayCsv = csv;
+  state.replayResult = replay;
+  state.replayFileName = fileName;
+  $('replay-filename').textContent = fileName ? `已选择：${fileName}` : '';
+  $('replay-clear').classList.remove('hidden');
+  $('replay-download').classList.remove('hidden');
+  $('replay-download').disabled = false;
+  renderReplayMessage();
+  renderReplayResult(replay);
+}
+
+function clearReplay() {
+  state.replayCsv = null;
+  state.replayResult = null;
+  state.replayFileName = '';
+  $('replay-file').value = '';
+  $('replay-filename').textContent = '';
+  $('replay-clear').classList.add('hidden');
+  $('replay-download').classList.add('hidden');
+  $('replay-download').disabled = true;
+  $('replay-results').innerHTML = '';
+  renderReplayMessage();
+}
+
+/** 走位数据变化后，若已有复盘则基于最新数据重新分析（失败仅提示，不阻塞数据刷新） */
+async function refreshReplay() {
+  if (!state.replayCsv) return;
+  try {
+    await analyzeReplay(state.replayCsv, state.replayFileName);
+  } catch (err) {
+    renderReplayMessage(`⚠️ 走位数据已变化且复盘无法自动重算：${escapeHtml(err.message)}，请重新上传 CSV。`, true);
+  }
+}
+
+function bindReplay() {
+  $('replay-file').addEventListener('change', async (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    try {
+      const csv = await file.text();
+      await analyzeReplay(csv, file.name);
+      const s = state.replayResult.summary;
+      toast(`复盘完成：配对 ${s.pairs} · 漏执行 ${s.missing} · 多余 ${s.extra} · 总成本 ${s.totalCost}`);
+    } catch (err) {
+      renderReplayMessage(`❌ ${escapeHtml(err.message)}`, true);
+      toast(err.message, true);
+    }
+  });
+
+  $('replay-clear').addEventListener('click', () => {
+    clearReplay();
+    toast('已清空复盘');
+  });
+
+  // POST 下载 Markdown（服务端按原始 CSV 重新解析对齐，只读不写库）
+  $('replay-download').addEventListener('click', async () => {
+    if (!state.replayCsv) return;
+    try {
+      const res = await fetch('/api/replay/report', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ csv: state.replayCsv, fileName: state.replayFileName }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || `下载失败（${res.status}）`);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = '现场走位复盘报告.md';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      toast(err.message, true);
+    }
+  });
+}
+
 /* ---------- 启动 ---------- */
 
 (async function init() {
@@ -1385,6 +1619,7 @@ function bindImport() {
   bindEvacuation();
   bindDependencies();
   bindImport();
+  bindReplay();
   setMode(state.mode);
   try {
     await refresh();

@@ -12,6 +12,12 @@ const {
   ImportFileError,
   TEMPLATE_HEADER,
 } = require('./import');
+const {
+  buildReplay,
+  renderReplayMarkdown,
+  ReplayFileError,
+  REPLAY_TEMPLATE_HEADER,
+} = require('./replay');
 
 const router = express.Router();
 
@@ -350,6 +356,57 @@ router.post('/import/commit', (req, res) => {
     createdCues: result.createdCues,
     version: result.version,
   });
+});
+
+/* ---------- 现场走位复盘 ---------- */
+
+/** 复盘 CSV 模板下载（带 UTF-8 BOM，Excel 直接打开中文不乱码） */
+router.get('/replay/template', (req, res) => {
+  const lines = [
+    REPLAY_TEMPLATE_HEADER.join(','),
+    // 两行填写示例：演员与区域必须是底库中已存在的值（未知 / 歧义值会逐行报错）
+    ['张三', '饰 王子', '00:21', '舞台中央'].join(','),
+    ['李四', '饰 公主', '01:02', '后台化妆间'].join(','),
+  ];
+  const content = '﻿' + lines.join('\r\n') + '\r\n';
+  const filename = encodeURIComponent('现场走位复盘模板.csv');
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename=replay-template.csv; filename*=UTF-8''${filename}`);
+  res.send(content);
+});
+
+/** 上传复盘 CSV：逐行解析现有演员 / 区域并按演员对齐计划口令（全程只读，绝不写库） */
+router.post('/replay/analyze', (req, res) => {
+  const data = store.load();
+  const csv = typeof (req.body && req.body.csv) === 'string' ? req.body.csv : '';
+  const fileName = typeof (req.body && req.body.fileName) === 'string' ? req.body.fileName.slice(0, 120) : '';
+  if (csv.trim() === '') return res.status(400).json({ error: '请先选择现场走位复盘 CSV 文件' });
+  try {
+    res.json(buildReplay(data, csv, fileName));
+  } catch (err) {
+    if (err instanceof ReplayFileError) return res.status(400).json({ error: err.message });
+    throw err;
+  }
+});
+
+/** 下载本次复盘 Markdown：服务端按原始 CSV 重新解析对齐（不信任客户端结果），同样只读 */
+router.post('/replay/report', (req, res) => {
+  const data = store.load();
+  const csv = typeof (req.body && req.body.csv) === 'string' ? req.body.csv : '';
+  const fileName = typeof (req.body && req.body.fileName) === 'string' ? req.body.fileName.slice(0, 120) : '';
+  if (csv.trim() === '') return res.status(400).json({ error: '复盘内容为空，请重新选择 CSV 文件' });
+  let replay;
+  try {
+    replay = buildReplay(data, csv, fileName);
+  } catch (err) {
+    if (err instanceof ReplayFileError) return res.status(400).json({ error: err.message });
+    throw err;
+  }
+  const md = renderReplayMarkdown(replay);
+  const filename = encodeURIComponent('现场走位复盘报告.md');
+  res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename=replay-report.md; filename*=UTF-8''${filename}`);
+  res.send(md);
 });
 
 /* ---------- 通用 CRUD ---------- */
