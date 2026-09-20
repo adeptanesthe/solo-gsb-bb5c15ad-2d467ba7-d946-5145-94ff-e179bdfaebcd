@@ -106,6 +106,30 @@
       </div>
     </section>
 
+    <!-- 现场走位复盘 -->
+    <section class="card" id="panel-replay">
+      <h2>🎬 现场走位复盘</h2>
+      <p class="mode-hint">
+        上传现场记录 UTF-8 CSV（表头固定为 <code>演员姓名,角色,实际时刻,实际区域</code>）：系统<strong>仅解析现有演员（姓名 + 角色）与现有区域（名称）</strong>，
+        未知或歧义的演员 / 区域、时刻格式错误<strong>逐行报错且不参与对齐</strong>。服务端按演员将实际记录与计划口令做
+        <strong>保持先后顺序的一对一最优对齐</strong>（两侧分别按计划时刻/口令 ID、实际时刻/CSV 行号排序）：
+        配对成本为<strong>时差绝对值</strong>，区域不符加 <strong>300</strong>，每条漏执行口令或多余记录加 <strong>180</strong>；
+        成本相同时先取配对数多者，再取实际记录行号序列字典序较小者，同一记录不重复匹配。
+        复盘为只读分析，<strong>不会改写任何走位数据</strong>；时刻支持秒数（如 <code>90</code>）或 <code>mm:ss</code>（如 <code>01:30</code>）。
+      </p>
+      <div class="import-toolbar">
+        <label class="btn btn-accent import-file-btn">
+          📂 选择现场记录 CSV 上传分析
+          <input type="file" id="replay-file" accept=".csv,text/csv" hidden />
+        </label>
+        <button type="button" class="btn btn-ghost hidden" id="replay-clear">清空复盘</button>
+        <button type="button" class="btn hidden" id="replay-download" disabled>⬇️ 下载本次复盘 Markdown</button>
+        <span class="import-filename" id="replay-filename"></span>
+      </div>
+      <div id="replay-message"></div>
+      <div id="replay-results"></div>
+    </section>
+
     <!-- 数据管理 -->
     <div class="panels">
       <section class="card" id="panel-areas">

@@ -512,4 +512,125 @@ function toMarkdown(result, evacuation) {
   return lines.join('\n');
 }
 
-module.exports = { toMarkdown, fmtTime };
+/** 时间偏差的纯文本：早到 / 晚到 / 准时 */
+function diffText(diff) {
+  if (diff === 0) return '准时';
+  return diff > 0 ? `晚到 ${diff} 秒` : `早到 ${-diff} 秒`;
+}
+
+/** 现场走位复盘结果 → Markdown（只读分析，不改写走位数据） */
+function toReplayMarkdown(result) {
+  const s = result.summary;
+  const lines = [];
+
+  lines.push('# 现场走位复盘报告');
+  lines.push('');
+  lines.push(`生成时间：${new Date(result.generatedAt).toLocaleString('zh-CN', { hour12: false })}`);
+  lines.push('');
+  lines.push('## 汇总');
+  lines.push('');
+  lines.push('| 指标 | 数值 |');
+  lines.push('| --- | --- |');
+  lines.push(`| CSV 数据行 | ${s.totalRows} |`);
+  lines.push(`| 有效行（参与对齐） | ${s.validRows} |`);
+  lines.push(`| 错误行（不参与对齐） | ${s.errorRows} |`);
+  lines.push(`| 复盘演员数 | ${s.actors} |`);
+  lines.push(`| 配对数 | ${s.pairs} |`);
+  lines.push(`| 漏执行口令 | ${s.missedCues} |`);
+  lines.push(`| 多余实际记录 | ${s.extraActuals} |`);
+  lines.push(`| 区域不符配对 | ${s.areaMismatches} |`);
+  lines.push(`| 配对时差绝对值合计 | ${s.totalTimeDiff} 秒 |`);
+  lines.push(`| **总成本** | **${s.totalCost}** |`);
+  lines.push('');
+  lines.push(
+    `对齐口径：保持计划口令与实际记录各自先后顺序的一对一最优对齐（同一记录不重复匹配）；` +
+      `配对成本 = 时差绝对值 +（区域不符 ${result.costRule.areaMismatchPenalty}），` +
+      `每条漏执行口令或多余实际记录计 ${result.costRule.gapPenalty}；` +
+      `计划侧按「计划时刻 / 口令 ID」排序，实际侧按「实际时刻 / CSV 行号」排序；` +
+      `总成本相同时先取配对数多者，再取实际记录行号序列字典序较小者。`
+  );
+  lines.push('');
+
+  /* CSV 逐行解析问题 */
+  const badRows = result.rows.filter((r) => !r.valid);
+  lines.push('## CSV 逐行解析');
+  lines.push('');
+  if (badRows.length === 0) {
+    lines.push(`✅ 全部 ${s.totalRows} 行均成功解析为现有演员与现有区域，全部参与对齐。`);
+    lines.push('');
+  } else {
+    lines.push(`共 ${badRows.length} 行存在问题（**错误行不参与对齐**）：`);
+    lines.push('');
+    lines.push('| 行号 | 演员姓名 | 角色 | 实际时刻 | 实际区域 | 问题 |');
+    lines.push('| --- | --- | --- | --- | --- | --- |');
+    for (const r of badRows) {
+      lines.push(
+        `| ${r.line} | ${r.name || '（空）'} | ${r.role || ''} | ${r.timeRaw || '（空）'} | ${r.areaName || '（空）'} | ${r.issues
+          .map((i) => i.message)
+          .join('；')} |`
+      );
+    }
+    lines.push('');
+  }
+
+  /* 每位演员的对齐明细 */
+  for (const a of result.actors) {
+    const title = a.actorRole ? `${a.actorName}（${a.actorRole}）` : a.actorName;
+    lines.push(`## ${title}`);
+    lines.push('');
+    lines.push(
+      `计划口令 ${a.cueCount} 条 / 实际记录 ${a.actualCount} 条：配对 **${a.pairs.length}** · ` +
+        `漏执行 ${a.missed.length} · 多余 ${a.extra.length} · 区域不符 ${a.cost.areaMismatches}；` +
+        `时差合计 ${a.cost.timeDiff} 秒，区域罚分 ${a.cost.areaPenalty}，漏项 / 多项罚分 ${a.cost.gapPenalty}，` +
+        `**总成本 ${a.cost.total}**。`
+    );
+    lines.push('');
+
+    if (a.pairs.length > 0) {
+      lines.push('### 配对明细');
+      lines.push('');
+      lines.push('| # | 计划口令（时刻 · 区域） | CSV 行号 | 实际记录（时刻 · 区域） | 时间偏差 | 区域偏差 | 配对成本 |');
+      lines.push('| --- | --- | --- | --- | --- | --- | --- |');
+      a.pairs.forEach((p, idx) => {
+        const cue = `${fmtTime(p.cueTime)}「${p.cueAreaName}」`;
+        const actual = `${fmtTime(p.actualTime)}「${p.actualAreaName}」`;
+        const area = p.areaMatch ? '✅ 一致' : `❌ 不符（+${result.costRule.areaMismatchPenalty}）`;
+        lines.push(
+          `| ${idx + 1} | ${cue} | ${p.actualLine} | ${actual} | ${diffText(p.timeDiff)}（差 ${p.timeDiffAbs} 秒） | ${area} | ${p.cost} |`
+        );
+      });
+      lines.push('');
+    }
+
+    if (a.missed.length > 0) {
+      lines.push(`### 漏执行口令（${a.missed.length}，每条 +${result.costRule.gapPenalty}）`);
+      lines.push('');
+      lines.push('| 计划时刻 | 计划区域 | 口令说明 |');
+      lines.push('| --- | --- | --- |');
+      for (const c of a.missed) {
+        lines.push(`| ${fmtTime(c.cueTime)} | ${c.cueAreaName} | ${c.cueNote || ''} |`);
+      }
+      lines.push('');
+    }
+
+    if (a.extra.length > 0) {
+      lines.push(`### 多余实际记录（${a.extra.length}，每条 +${result.costRule.gapPenalty}）`);
+      lines.push('');
+      lines.push('| CSV 行号 | 实际时刻 | 实际区域 |');
+      lines.push('| --- | --- | --- |');
+      for (const e of a.extra) {
+        lines.push(`| ${e.actualLine} | ${fmtTime(e.actualTime)} | ${e.actualAreaName} |`);
+      }
+      lines.push('');
+    }
+  }
+
+  lines.push('---');
+  lines.push('');
+  lines.push('本次复盘仅基于上传 CSV 与现有走位数据只读分析，未改写任何走位数据。');
+  lines.push('');
+
+  return lines.join('\n');
+}
+
+module.exports = { toMarkdown, toReplayMarkdown, fmtTime };

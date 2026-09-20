@@ -16,6 +16,9 @@ const state = {
   importCsv: null, // 最近一次选择的 CSV 原文
   importPlan: null, // 服务端返回的导入计划（含 rows / newActors / summary / version）
   importFileName: '',
+  replayCsv: null, // 最近一次复盘 CSV 原文
+  replayResult: null, // 服务端返回的复盘结果
+  replayFileName: '',
 };
 
 /* ---------- 工具 ---------- */
@@ -1376,6 +1379,211 @@ function bindImport() {
   });
 }
 
+/* ---------- 现场走位复盘 ---------- */
+
+function renderReplayMessage(html = '', isError = false) {
+  const el = $('replay-message');
+  el.className = isError ? 'import-message error' : 'import-message';
+  el.innerHTML = html;
+}
+
+/** 时间偏差单元格：正为晚到、负为早到、0 为准时 */
+function replayDiffHtml(diff, abs) {
+  if (diff === 0) return '<span class="ontime-tag">准时</span>';
+  if (diff > 0) return `<span class="late-tag">晚到 ${diff} 秒</span>`;
+  return `<span class="early-tag">早到 ${-diff} 秒</span>`;
+}
+
+/** 渲染复盘结果：汇总徽章 + 错误行表 + 每位演员的配对 / 漏项 / 多项 */
+function renderReplay(result) {
+  const s = result.summary;
+  const chips = [
+    `<span class="imp-chip">数据行 <strong>${s.totalRows}</strong></span>`,
+    `<span class="imp-chip ${s.validRows ? 'good' : ''}">有效行 <strong>${s.validRows}</strong></span>`,
+    `<span class="imp-chip ${s.errorRows ? 'bad' : ''}">错误行 <strong>${s.errorRows}</strong></span>`,
+    `<span class="imp-chip">复盘演员 <strong>${s.actors}</strong></span>`,
+    `<span class="imp-chip">配对 <strong>${s.pairs}</strong></span>`,
+    `<span class="imp-chip ${s.missedCues ? 'bad' : ''}">漏执行口令 <strong>${s.missedCues}</strong></span>`,
+    `<span class="imp-chip ${s.extraActuals ? 'bad' : ''}">多余记录 <strong>${s.extraActuals}</strong></span>`,
+    `<span class="imp-chip ${s.areaMismatches ? 'bad' : ''}">区域不符 <strong>${s.areaMismatches}</strong></span>`,
+    `<span class="imp-chip">时差合计 <strong>${s.totalTimeDiff}</strong> 秒</span>`,
+    `<span class="imp-chip ${s.totalCost ? 'new' : 'good'}">总成本 <strong>${s.totalCost}</strong></span>`,
+  ].join('');
+
+  let html = `<div class="imp-chips">${chips}</div>`;
+  html += `<p class="imp-version">成本口径：配对时差绝对值 + 区域不符 ${result.costRule.areaMismatchPenalty}/次 + 漏项 / 多项 ${result.costRule.gapPenalty}/条；成本相同先取配对数多者，再取实际记录行号序列字典序较小者。</p>`;
+
+  /* 错误行 */
+  const badRows = result.rows.filter((r) => !r.valid);
+  if (badRows.length > 0) {
+    const errRowsHtml = badRows
+      .map(
+        (r) => `<tr class="imp-row-err">
+          <td>${r.line}</td>
+          <td>${escapeHtml(r.name || '（空）')}<span class="time-detail">${escapeHtml(r.role || '无角色')}</span></td>
+          <td>${escapeHtml(r.timeRaw || '（空）')}</td>
+          <td>${escapeHtml(r.areaName || '（空）')}</td>
+          <td><ul class="imp-issues">${r.issues.map((i) => `<li>${escapeHtml(i.message)}</li>`).join('')}</ul></td>
+        </tr>`
+      )
+      .join('');
+    html += `<div class="replay-group">
+      <h4>🚫 解析失败的数据行（${badRows.length} 行，不参与对齐）</h4>
+      <div class="imp-table-wrap">
+        <table class="imp-table">
+          <thead><tr><th>CSV 行号</th><th>演员姓名 / 角色</th><th>实际时刻</th><th>实际区域</th><th>问题</th></tr></thead>
+          <tbody>${errRowsHtml}</tbody>
+        </table>
+      </div>
+    </div>`;
+  } else {
+    html += '<p class="imp-ready">✅ 全部数据行均解析为现有演员与现有区域。</p>';
+  }
+
+  /* 每位演员 */
+  if (result.actors.length === 0) {
+    html += '<p class="empty-hint">没有可复盘的演员（有效行与计划口令均为空）。</p>';
+  }
+  html += result.actors
+    .map((a) => {
+      const role = a.actorRole ? `<span class="cue-count">（${escapeHtml(a.actorRole)}）</span>` : '';
+      const head = `<h3>${escapeHtml(a.actorName)} ${role}
+        <span class="cue-count">计划 ${a.cueCount} 条 / 实际 ${a.actualCount} 条 · 配对 ${a.pairs.length} · 漏 ${a.missed.length} · 多 ${a.extra.length}</span>
+        <span class="replay-cost">总成本 ${a.cost.total}</span>
+        <span class="time-detail">时差 ${a.cost.timeDiff} 秒 · 区域罚分 ${a.cost.areaPenalty} · 漏项/多项罚分 ${a.cost.gapPenalty}</span>
+      </h3>`;
+
+      let body = '';
+      if (a.pairs.length > 0) {
+        const pairRows = a.pairs
+          .map(
+            (p, idx) => `<tr class="${p.areaMatch ? '' : 'replay-row-mismatch'}">
+              <td>${idx + 1}</td>
+              <td>${fmtTime(p.cueTime)}<span class="time-detail">${escapeHtml(p.cueAreaName)}${p.cueNote ? ' · ' + escapeHtml(p.cueNote) : ''}</span></td>
+              <td>${p.actualLine}</td>
+              <td>${fmtTime(p.actualTime)}<span class="time-detail">${escapeHtml(p.actualAreaName)}</span></td>
+              <td>${replayDiffHtml(p.timeDiff, p.timeDiffAbs)}<span class="time-detail">差 ${p.timeDiffAbs} 秒</span></td>
+              <td>${p.areaMatch ? '<span class="imp-ok">✅ 一致</span>' : `<span class="imp-bad">❌ 不符（+${result.costRule.areaMismatchPenalty}）</span>`}</td>
+              <td>${p.cost}</td>
+            </tr>`
+          )
+          .join('');
+        body += `<div class="replay-pairs">
+          <table>
+            <thead><tr><th>#</th><th>计划口令</th><th>CSV 行号</th><th>实际记录</th><th>时间偏差</th><th>区域偏差</th><th>配对成本</th></tr></thead>
+            <tbody>${pairRows}</tbody>
+          </table>
+        </div>`;
+      }
+
+      if (a.missed.length > 0) {
+        body += `<div class="replay-sub">
+          <h5 class="replay-miss-title">漏执行口令（${a.missed.length}，每条 +${result.costRule.gapPenalty}）</h5>
+          <ul class="replay-items">
+            ${a.missed
+              .map((c) => `<li><span class="late-tag">${fmtTime(c.cueTime)}</span> ${escapeHtml(c.cueAreaName)}${c.cueNote ? ` · ${escapeHtml(c.cueNote)}` : ''}</li>`)
+              .join('')}
+          </ul>
+        </div>`;
+      }
+
+      if (a.extra.length > 0) {
+        body += `<div class="replay-sub">
+          <h5 class="replay-extra-title">多余实际记录（${a.extra.length}，每条 +${result.costRule.gapPenalty}）</h5>
+          <ul class="replay-items">
+            ${a.extra
+              .map((e) => `<li><span class="early-tag">第 ${e.actualLine} 行</span> ${fmtTime(e.actualTime)} ${escapeHtml(e.actualAreaName)}</li>`)
+              .join('')}
+          </ul>
+        </div>`;
+      }
+
+      if (!body) body = '<p class="empty-hint">该演员没有计划口令也没有有效实际记录。</p>';
+      return `<div class="actor-block replay-actor">${head}${body}</div>`;
+    })
+    .join('');
+
+  $('replay-results').innerHTML = html;
+}
+
+async function analyzeReplay(csv, fileName) {
+  const result = await api('/api/replay/analyze', 'POST', { csv });
+  state.replayCsv = csv;
+  state.replayResult = result;
+  state.replayFileName = fileName;
+  $('replay-filename').textContent = fileName ? `已选择：${fileName}` : '';
+  $('replay-clear').classList.remove('hidden');
+  $('replay-download').classList.remove('hidden');
+  $('replay-download').disabled = false;
+  renderReplayMessage();
+  renderReplay(result);
+}
+
+function clearReplay() {
+  state.replayCsv = null;
+  state.replayResult = null;
+  state.replayFileName = '';
+  $('replay-file').value = '';
+  $('replay-filename').textContent = '';
+  $('replay-clear').classList.add('hidden');
+  $('replay-download').classList.add('hidden');
+  $('replay-download').disabled = true;
+  $('replay-results').innerHTML = '';
+  renderReplayMessage();
+}
+
+/** 下载本次复盘 Markdown：CSV 原文 POST 到服务端重新计算后下载（不依赖页面结果快照） */
+async function downloadReplayReport(csv) {
+  const res = await fetch('/api/replay/report', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ csv }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `下载失败（${res.status}）`);
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = '现场走位复盘报告.md';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function bindReplay() {
+  $('replay-file').addEventListener('change', async (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    try {
+      const csv = await file.text();
+      await analyzeReplay(csv, file.name);
+    } catch (err) {
+      renderReplayMessage(`❌ ${escapeHtml(err.message)}`, true);
+      toast(err.message, true);
+    }
+  });
+
+  $('replay-clear').addEventListener('click', () => {
+    clearReplay();
+    toast('已清空复盘结果');
+  });
+
+  $('replay-download').addEventListener('click', async () => {
+    if (!state.replayCsv) return;
+    try {
+      await downloadReplayReport(state.replayCsv);
+      toast('已下载本次复盘 Markdown');
+    } catch (err) {
+      renderReplayMessage(`❌ ${escapeHtml(err.message)}`, true);
+      toast(err.message, true);
+    }
+  });
+}
+
 /* ---------- 启动 ---------- */
 
 (async function init() {
@@ -1385,6 +1593,7 @@ function bindImport() {
   bindEvacuation();
   bindDependencies();
   bindImport();
+  bindReplay();
   setMode(state.mode);
   try {
     await refresh();

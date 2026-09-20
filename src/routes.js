@@ -4,7 +4,7 @@ const store = require('./store');
 const { validate, MODES } = require('./validate');
 const { evacuationSnapshot } = require('./evacuation');
 const { buildComparison } = require('./baseline');
-const { toMarkdown } = require('./report');
+const { toMarkdown, toReplayMarkdown } = require('./report');
 const { findCycle, cycleMessage, MAX_WAIT_SECONDS } = require('./dependencies');
 const {
   buildImportPlan,
@@ -12,6 +12,7 @@ const {
   ImportFileError,
   TEMPLATE_HEADER,
 } = require('./import');
+const { buildReplay, ImportFileError: ReplayFileError } = require('./replay');
 
 const router = express.Router();
 
@@ -350,6 +351,38 @@ router.post('/import/commit', (req, res) => {
     createdCues: result.createdCues,
     version: result.version,
   });
+});
+
+/* ---------- 现场走位复盘 ---------- */
+
+/** 上传现场实际记录 CSV 并返回复盘结果（只读分析，不写库、不改写走位数据） */
+router.post('/replay/analyze', (req, res) => {
+  const csv = typeof (req.body && req.body.csv) === 'string' ? req.body.csv : '';
+  if (csv.trim() === '') return res.status(400).json({ error: '请先选择现场记录 CSV 文件' });
+  try {
+    res.json(buildReplay(store.load(), csv));
+  } catch (err) {
+    if (err instanceof ReplayFileError) return res.status(400).json({ error: err.message });
+    throw err;
+  }
+});
+
+/** 下载本次复盘 Markdown：服务端按原始 CSV 重新计算后渲染（结果与页面同口径，不落盘） */
+router.post('/replay/report', (req, res) => {
+  const csv = typeof (req.body && req.body.csv) === 'string' ? req.body.csv : '';
+  if (csv.trim() === '') return res.status(400).json({ error: '复盘内容为空，请重新选择 CSV 文件' });
+  let result;
+  try {
+    result = buildReplay(store.load(), csv);
+  } catch (err) {
+    if (err instanceof ReplayFileError) return res.status(400).json({ error: err.message });
+    throw err;
+  }
+  const md = toReplayMarkdown(result);
+  const filename = encodeURIComponent('现场走位复盘报告.md');
+  res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename=replay-report.md; filename*=UTF-8''${filename}`);
+  res.send(md);
 });
 
 /* ---------- 通用 CRUD ---------- */
